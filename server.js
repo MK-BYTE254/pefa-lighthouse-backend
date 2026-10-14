@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require("express");
@@ -6,6 +5,7 @@ const db = require("./database");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const DARAJA_ENV = process.env.DARAJA_ENV || "sandbox";
 
 app.use(express.json({ limit: "100kb" }));
 
@@ -92,6 +92,12 @@ app.get("/api/daraja/test-token", async (req, res) => {
 
 // 4. STK Push request — Sandbox only
 app.post("/api/mpesa/stk-push", async (req, res) => {
+    if (DARAJA_ENV !== "sandbox") {
+    return res.status(503).json({
+      success: false,
+      message: "Payments are disabled outside sandbox while verification is being configured."
+    });
+  }
   const { amount, phoneNumber, givingType } = req.body || {};
   const paymentAmount = Number(amount);
 
@@ -357,8 +363,7 @@ app.post("/api/giving/callback", (req, res) => {
       });
     }
 
-    const newStatus = resultCode === 0 ? "paid" : "failed";
-
+    const newStatus = resultCode === 0 ? "pending" : "failed";
     db.prepare(`
       UPDATE donations
       SET status = ?,
