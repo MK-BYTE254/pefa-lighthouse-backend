@@ -2,11 +2,13 @@
 require("dotenv").config();
 
 const express = require("express");
+const db = require("./database");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "100kb" }));
+
 
 // 1. Basic health check
 app.get("/", (req, res) => {
@@ -140,6 +142,7 @@ app.post("/api/mpesa/stk-push", async (req, res) => {
   const shortcode = process.env.DARAJA_SHORTCODE;
   const passkey = process.env.DARAJA_PASSKEY;
   const callbackUrl = process.env.DARAJA_CALLBACK_URL;
+  console.log("Callback URL being sent to Daraja:", callbackUrl);
 
   if (!consumerKey || !consumerSecret || !shortcode || !passkey) {
     return res.status(500).json({
@@ -229,28 +232,54 @@ app.post("/api/mpesa/stk-push", async (req, res) => {
 
     const stkData = await stkResponse.json();
 
-    if (!stkResponse.ok || stkData.ResponseCode !== "0") {
-      console.error(
-        "Daraja STK Push request rejected:",
-        stkData.errorCode ||
-          stkData.ResponseCode ||
-          stkResponse.status
-      );
+   
+if (!stkResponse.ok || stkData.ResponseCode !== "0") {
+  console.error("Daraja STK Push rejection:", {
+    httpStatus: stkResponse.status,
+    errorCode: stkData.errorCode,
+    errorMessage: stkData.errorMessage,
+    responseCode: stkData.ResponseCode,
+    responseDescription: stkData.ResponseDescription,
+    customerMessage: stkData.CustomerMessage
+  });
 
-      return res.status(502).json({
-        success: false,
-        message: "Daraja did not accept the STK Push request. Check the sandbox configuration."
-      });
-    }
+  return res.status(502).json({
+    success: false,
+    message: "Daraja rejected the STK Push request. Check the backend terminal for details."
+  });
+}
+
+
+    
+    // Save the accepted STK Push request as pending.
+    const saveDonation = db.prepare(`
+      INSERT INTO donations (
+        checkout_request_id,
+        merchant_request_id,
+        phone_number,
+        amount,
+        giving_type,
+        status
+      ) VALUES (?, ?, ?, ?, ?, 'pending')
+    `);
+
+    saveDonation.run(
+      stkData.CheckoutRequestID,
+      stkData.MerchantRequestID,
+      phone,
+      amount,
+      givingType
+    );
 
     // Request accepted does not mean payment completed.
     return res.status(200).json({
       success: true,
-      message: "Daraja accepted the sandbox STK Push request. This does not confirm payment.",
+      message: "Daraja accepted the sandbox STK Push request. Payment is still pending.",
       checkoutRequestId: stkData.CheckoutRequestID,
       merchantRequestId: stkData.MerchantRequestID,
       responseDescription: stkData.ResponseDescription
     });
+
   } catch (error) {
     console.error("STK Push connection error:", error.message);
 
@@ -263,7 +292,8 @@ app.post("/api/mpesa/stk-push", async (req, res) => {
 
 // 5. Initial Daraja callback receiver
 // This acknowledges callbacks but does not save payment records.
-app.post("/api/mpesa/callback", (req, res) => {
+
+app.post("/api/giving/callback", (req, res) => {
   const callback = req.body?.Body?.stkCallback;
 
   if (!callback) {
@@ -275,18 +305,94 @@ app.post("/api/mpesa/callback", (req, res) => {
     });
   }
 
+  const checkoutRequestId = callback.CheckoutRequestID;
+  const resultCode = Number(callback.ResultCode);
+  const resultDescription =
+    callback.ResultDesc || "No description provided";
+
+  // Safaricom includes receipt details on successful transactions.
+  const items = callback.CallbackMetadata?.Item || [];
+  const metadata = Object.fromEntries(
+    items.map((item) => [item.Name, item.Value])
+  );
+
+  const receiptNumber = metadata.MpesaReceiptNumber || null;
+
   console.log("Daraja callback received:", {
-    resultCode: callback.ResultCode,
-    checkoutRequestId: callback.CheckoutRequestID || null,
-    merchantRequestId: callback.MerchantRequestID || null,
-    resultDescription: callback.ResultDesc || "No description provided"
+    resultCode,
+    checkoutRequestId: checkoutRequestId || null,
+    resultDescription
   });
 
-  // Database persistence and payment reconciliation are still required.
-  return res.status(200).json({
-    ResultCode: 0,
-    ResultDesc: "Callback received."
-  });
+  if (!checkoutRequestId || !Number.isFinite(resultCode)) {
+    return res.status(400).json({
+      ResultCode: 1,
+      ResultDesc: "Missing transaction result details."
+    });
+  }
+
+  try {
+    const donation = db.prepare(`
+      SELECT id, status
+      FROM donations
+      WHERE checkout_request_id = ?
+    `).get(checkoutRequestId);
+
+    if (!donation) {
+      console.warn("No matching donation found for callback:", checkoutRequestId);
+
+      // Acknowledge the callback, but do not create a donation
+      // from an unrecognized callback.
+      return res.status(200).json({
+        ResultCode: 0,
+        ResultDesc: "Callback received; no matching donation found."
+      });
+    }
+
+    // Never downgrade a previously confirmed successful payment.
+    if (donation.status === "paid") {
+      return res.status(200).json({
+        ResultCode: 0,
+        ResultDesc: "Callback already processed."
+      });
+    }
+
+    const newStatus = resultCode === 0 ? "paid" : "failed";
+
+    db.prepare(`
+      UPDATE donations
+      SET status = ?,
+          result_code = ?,
+          result_description = ?,
+          mpesa_receipt_number = ?,
+          updated_at = datetime('now')
+      WHERE checkout_request_id = ?
+    `).run(
+      newStatus,
+      resultCode,
+      resultDescription,
+      receiptNumber,
+      checkoutRequestId
+    );
+
+    console.log("Donation record updated:", {
+      checkoutRequestId,
+      status: newStatus,
+      receiptNumber
+    });
+
+    return res.status(200).json({
+      ResultCode: 0,
+      ResultDesc: "Callback processed."
+    });
+  } catch (error) {
+    console.error("Could not update donation record:", error.message);
+
+    return res.status(500).json({
+      ResultCode: 1,
+      ResultDesc: "Could not process callback."
+    });
+  }
 });
 
 // Start the server
