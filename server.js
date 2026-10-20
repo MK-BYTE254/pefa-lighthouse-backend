@@ -1,7 +1,9 @@
+
 require("dotenv").config();
 
 const express = require("express");
 const db = require("./database");
+const { processCallback } = require("./mpesa-callback");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,8 +11,7 @@ const DARAJA_ENV = process.env.DARAJA_ENV || "sandbox";
 
 app.use(express.json({ limit: "100kb" }));
 
-
-// 1. Basic health check
+// 1. Backend health check
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -19,7 +20,7 @@ app.get("/", (req, res) => {
 });
 
 // 2. Giving service status
-// Keep payments disabled until the full payment flow is tested.
+// Payments remain disabled until secure payment confirmation is ready.
 app.get("/api/giving/status", (req, res) => {
   res.json({
     success: true,
@@ -28,9 +29,15 @@ app.get("/api/giving/status", (req, res) => {
   });
 });
 
-// 3. Test Daraja Sandbox authentication
-// This route does not initiate a payment.
+// 3. Daraja Sandbox authentication test
 app.get("/api/daraja/test-token", async (req, res) => {
+  if (DARAJA_ENV !== "sandbox") {
+    return res.status(400).json({
+      success: false,
+      message: "This test route is restricted to sandbox mode."
+    });
+  }
+
   const consumerKey = process.env.DARAJA_CONSUMER_KEY;
   const consumerSecret = process.env.DARAJA_CONSUMER_SECRET;
 
@@ -38,13 +45,6 @@ app.get("/api/daraja/test-token", async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Daraja credentials are missing from backend configuration."
-    });
-  }
-
-  if (process.env.DARAJA_ENV !== "sandbox") {
-    return res.status(400).json({
-      success: false,
-      message: "This test route is restricted to sandbox mode."
     });
   }
 
@@ -72,7 +72,7 @@ app.get("/api/daraja/test-token", async (req, res) => {
 
       return res.status(502).json({
         success: false,
-        message: "Daraja authentication failed. Check your sandbox credentials."
+        message: "Daraja authentication failed. Check the sandbox credentials."
       });
     }
 
@@ -85,23 +85,24 @@ app.get("/api/daraja/test-token", async (req, res) => {
 
     return res.status(502).json({
       success: false,
-      message: "Could not connect to Daraja. Check your internet connection."
+      message: "Could not connect to Daraja."
     });
   }
 });
 
-// 4. STK Push request — Sandbox only
+// 4. M-Pesa STK Push — Sandbox only
+// An accepted request is NOT proof of a completed payment.
 app.post("/api/mpesa/stk-push", async (req, res) => {
-    if (DARAJA_ENV !== "sandbox") {
+  if (DARAJA_ENV !== "sandbox") {
     return res.status(503).json({
       success: false,
-      message: "Payments are disabled outside sandbox while verification is being configured."
+      message: "This endpoint is restricted to Daraja Sandbox mode."
     });
   }
+
   const { amount, phoneNumber, givingType } = req.body || {};
   const paymentAmount = Number(amount);
 
-  // Validate amount
   if (!Number.isSafeInteger(paymentAmount) || paymentAmount < 1) {
     return res.status(400).json({
       success: false,
@@ -109,7 +110,6 @@ app.post("/api/mpesa/stk-push", async (req, res) => {
     });
   }
 
-  // Normalize Kenyan mobile numbers to 254 format
   let phone = String(phoneNumber || "").replace(/[\s+-]/g, "");
 
   if (/^0[17]\d{8}$/.test(phone)) {
@@ -135,20 +135,11 @@ app.post("/api/mpesa/stk-push", async (req, res) => {
     ? givingType
     : "Offering";
 
-  // Never use this endpoint for production payments.
-  if (process.env.DARAJA_ENV !== "sandbox") {
-    return res.status(400).json({
-      success: false,
-      message: "This endpoint is restricted to Daraja Sandbox mode."
-    });
-  }
-
   const consumerKey = process.env.DARAJA_CONSUMER_KEY;
   const consumerSecret = process.env.DARAJA_CONSUMER_SECRET;
   const shortcode = process.env.DARAJA_SHORTCODE;
   const passkey = process.env.DARAJA_PASSKEY;
   const callbackUrl = process.env.DARAJA_CALLBACK_URL;
-  console.log("Callback URL being sent to Daraja:", callbackUrl);
 
   if (!consumerKey || !consumerSecret || !shortcode || !passkey) {
     return res.status(500).json({
@@ -157,15 +148,18 @@ app.post("/api/mpesa/stk-push", async (req, res) => {
     });
   }
 
-  if (!callbackUrl || !callbackUrl.startsWith("https://")) {
+  if (
+    !callbackUrl ||
+    !callbackUrl.startsWith("https://")
+  ) {
     return res.status(500).json({
       success: false,
-      message: "Configure a public HTTPS callback URL before testing STK Push."
+      message: "Configure a publicly reachable HTTPS callback URL."
     });
   }
 
   try {
-    // Obtain Daraja access token
+    // Obtain a Daraja access token.
     const credentials = Buffer.from(
       `${consumerKey}:${consumerSecret}`
     ).toString("base64");
@@ -183,7 +177,7 @@ app.post("/api/mpesa/stk-push", async (req, res) => {
 
     if (!tokenResponse.ok || !tokenData.access_token) {
       console.error(
-        "Daraja authentication failed. HTTP status:",
+        "Daraja token request failed. HTTP status:",
         tokenResponse.status
       );
 
@@ -193,7 +187,7 @@ app.post("/api/mpesa/stk-push", async (req, res) => {
       });
     }
 
-    // Generate timestamp in YYYYMMDDHHmmss format
+    // Generate the timestamp and STK Push password.
     const now = new Date();
 
     const timestamp =
@@ -204,7 +198,6 @@ app.post("/api/mpesa/stk-push", async (req, res) => {
       String(now.getMinutes()).padStart(2, "0") +
       String(now.getSeconds()).padStart(2, "0");
 
-    // Generate the STK Push password
     const password = Buffer.from(
       `${shortcode}${passkey}${timestamp}`
     ).toString("base64");
@@ -223,7 +216,7 @@ app.post("/api/mpesa/stk-push", async (req, res) => {
       TransactionDesc: `Church ${selectedGivingType}`.slice(0, 13)
     };
 
-    // Send STK Push request to Daraja Sandbox
+    // Submit the STK Push request to Daraja Sandbox.
     const stkResponse = await fetch(
       "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest",
       {
@@ -238,27 +231,23 @@ app.post("/api/mpesa/stk-push", async (req, res) => {
 
     const stkData = await stkResponse.json();
 
-   
-if (!stkResponse.ok || stkData.ResponseCode !== "0") {
-  console.error("Daraja STK Push rejection:", {
-    httpStatus: stkResponse.status,
-    errorCode: stkData.errorCode,
-    errorMessage: stkData.errorMessage,
-    responseCode: stkData.ResponseCode,
-    responseDescription: stkData.ResponseDescription,
-    customerMessage: stkData.CustomerMessage
-  });
+    if (!stkResponse.ok || stkData.ResponseCode !== "0") {
+      console.error(
+        "Daraja STK Push request rejected:",
+        stkData.errorCode ||
+          stkData.ResponseCode ||
+          stkResponse.status
+      );
 
-  return res.status(502).json({
-    success: false,
-    message: "Daraja rejected the STK Push request. Check the backend terminal for details."
-  });
-}
+      return res.status(502).json({
+        success: false,
+        message: "Daraja did not accept the STK Push request."
+      });
+    }
 
-
-    
-    // Save the accepted STK Push request as pending.
-    const saveDonation = db.prepare(`
+    // Record the accepted request as pending.
+    // Never mark it paid just because STK Push was accepted.
+    db.prepare(`
       INSERT INTO donations (
         checkout_request_id,
         merchant_request_id,
@@ -266,28 +255,26 @@ if (!stkResponse.ok || stkData.ResponseCode !== "0") {
         amount,
         giving_type,
         status
-      ) VALUES (?, ?, ?, ?, ?, 'pending')
-    `);
-
-    saveDonation.run(
+      )
+      VALUES (?, ?, ?, ?, ?, 'pending')
+    `).run(
       stkData.CheckoutRequestID,
-      stkData.MerchantRequestID,
+      stkData.MerchantRequestID || null,
       phone,
-      amount,
-      givingType
+      paymentAmount,
+      selectedGivingType
     );
 
-    // Request accepted does not mean payment completed.
     return res.status(200).json({
       success: true,
-      message: "Daraja accepted the sandbox STK Push request. Payment is still pending.",
+      message:
+        "Daraja accepted the sandbox request. This does not confirm payment.",
       checkoutRequestId: stkData.CheckoutRequestID,
       merchantRequestId: stkData.MerchantRequestID,
       responseDescription: stkData.ResponseDescription
     });
-
   } catch (error) {
-    console.error("STK Push connection error:", error.message);
+    console.error("STK Push processing error:", error.message);
 
     return res.status(502).json({
       success: false,
@@ -296,102 +283,25 @@ if (!stkResponse.ok || stkData.ResponseCode !== "0") {
   }
 });
 
-// 5. Initial Daraja callback receiver
-// This acknowledges callbacks but does not save payment records.
-
+// 5. Daraja callback receiver
+// Callback processing is handled by the tested mpesa-callback.js module.
 app.post("/api/giving/callback", (req, res) => {
-  const callback = req.body?.Body?.stkCallback;
-
-  if (!callback) {
-    console.warn("Received an unexpected M-Pesa callback payload.");
-
-    return res.status(400).json({
-      ResultCode: 1,
-      ResultDesc: "Invalid callback payload."
-    });
-  }
-
-  const checkoutRequestId = callback.CheckoutRequestID;
-  const resultCode = Number(callback.ResultCode);
-  const resultDescription =
-    callback.ResultDesc || "No description provided";
-
-  // Safaricom includes receipt details on successful transactions.
-  const items = callback.CallbackMetadata?.Item || [];
-  const metadata = Object.fromEntries(
-    items.map((item) => [item.Name, item.Value])
-  );
-
-  const receiptNumber = metadata.MpesaReceiptNumber || null;
-
-  console.log("Daraja callback received:", {
-    resultCode,
-    checkoutRequestId: checkoutRequestId || null,
-    resultDescription
-  });
-
-  if (!checkoutRequestId || !Number.isFinite(resultCode)) {
-    return res.status(400).json({
-      ResultCode: 1,
-      ResultDesc: "Missing transaction result details."
-    });
-  }
-
   try {
-    const donation = db.prepare(`
-      SELECT id, status
-      FROM donations
-      WHERE checkout_request_id = ?
-    `).get(checkoutRequestId);
+    const result = processCallback(db, req.body);
 
-    if (!donation) {
-      console.warn("No matching donation found for callback:", checkoutRequestId);
-
-      // Acknowledge the callback, but do not create a donation
-      // from an unrecognized callback.
-      return res.status(200).json({
-        ResultCode: 0,
-        ResultDesc: "Callback received; no matching donation found."
-      });
+    if (result.httpStatus >= 400) {
+      console.warn("Rejected callback:", result.ResultDesc);
     }
 
-    // Never downgrade a previously confirmed successful payment.
-    if (donation.status === "paid") {
-      return res.status(200).json({
-        ResultCode: 0,
-        ResultDesc: "Callback already processed."
-      });
-    }
-
-    const newStatus = resultCode === 0 ? "pending" : "failed";
-    db.prepare(`
-      UPDATE donations
-      SET status = ?,
-          result_code = ?,
-          result_description = ?,
-          mpesa_receipt_number = ?,
-          updated_at = datetime('now')
-      WHERE checkout_request_id = ?
-    `).run(
-      newStatus,
-      resultCode,
-      resultDescription,
-      receiptNumber,
-      checkoutRequestId
-    );
-
-    console.log("Donation record updated:", {
-      checkoutRequestId,
-      status: newStatus,
-      receiptNumber
-    });
-
-    return res.status(200).json({
-      ResultCode: 0,
-      ResultDesc: "Callback processed."
+    return res.status(result.httpStatus).json({
+      ResultCode: result.ResultCode,
+      ResultDesc: result.ResultDesc
     });
   } catch (error) {
-    console.error("Could not update donation record:", error.message);
+    console.error(
+      "Could not process donation callback:",
+      error.message
+    );
 
     return res.status(500).json({
       ResultCode: 1,
@@ -400,7 +310,7 @@ app.post("/api/giving/callback", (req, res) => {
   }
 });
 
-// Start the server
+// Start the backend.
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`PEFA Lighthouse backend running on port ${PORT}`);
 });
