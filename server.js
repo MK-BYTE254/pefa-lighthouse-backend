@@ -4,12 +4,16 @@ require("dotenv").config();
 const express = require("express");
 const db = require("./database");
 const { processCallback } = require("./mpesa-callback");
+const { router: adminAuthRouter } = require("./admin-auth");
+const adminContentRouter = require("./admin-content");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DARAJA_ENV = process.env.DARAJA_ENV || "sandbox";
 
 app.use(express.json({ limit: "100kb" }));
+app.use("/api/admin", adminAuthRouter);
+app.use("/api/content", adminContentRouter);
 
 // 1. Backend health check
 app.get("/", (req, res) => {
